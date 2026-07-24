@@ -178,6 +178,7 @@ export class CodeGraph {
   private synthesisDirty = false;
   private synthesisRunning = false;
   private synthesisClosed = false;
+  private closing = false;
   private closed = false;
   private closePromise: Promise<void> | null = null;
 
@@ -441,6 +442,11 @@ export class CodeGraph {
    */
   close(): void {
     if (this.closed || this.closePromise) return;
+    if (this.indexMutex.isLocked() || this.synthesisRunning) {
+      throw new Error(
+        'CodeGraph.close() cannot safely close while indexing or synthesis is active; await closeAsync() instead'
+      );
+    }
     this.prepareForClose();
     this.finishClose();
   }
@@ -458,6 +464,12 @@ export class CodeGraph {
     const watcher = this.prepareForClose();
     this.closePromise = (async () => {
       await watcher?.stopAndDrain();
+      // The watcher barrier covers watcher-triggered sync, but library callers
+      // may also have started indexAll()/sync(), and deferred synthesis uses the
+      // same mutex. Acquiring it after shutdown is latched drains whichever
+      // operation already owns it. The second lifecycle check inside each
+      // writer prevents queued/new work from starting ahead of this barrier.
+      await this.indexMutex.withLock(() => undefined);
       this.finishClose();
     })();
     return this.closePromise;
@@ -465,6 +477,7 @@ export class CodeGraph {
 
   /** Stop new background work and detach the watcher for shutdown. */
   private prepareForClose(): FileWatcher | null {
+    this.closing = true;
     // Disarm deferred re-synthesis before the DB goes away — a timer that
     // fired against a closed connection would throw from a bare setTimeout
     // callback with no caller to catch it.
@@ -477,6 +490,13 @@ export class CodeGraph {
     this.watcher = null;
     watcher?.stop();
     return watcher;
+  }
+
+  /** Reject new database-writing work once shutdown has begun. */
+  private assertAcceptingWriteWork(operation: string): void {
+    if (this.closing || this.closed) {
+      throw new Error(`Cannot ${operation}: CodeGraph is closing or closed`);
+    }
   }
 
   /** Release storage resources exactly once after background work is quiescent. */
@@ -505,7 +525,9 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async indexAll(options: IndexOptions = {}): Promise<IndexResult> {
+    this.assertAcceptingWriteWork('index files');
     return this.indexMutex.withLock(async () => {
+      this.assertAcceptingWriteWork('index files');
       try {
         this.fileLock.acquire();
       } catch {
@@ -814,7 +836,9 @@ export class CodeGraph {
    * Uses a mutex to prevent concurrent indexing operations.
    */
   async sync(options: IndexOptions = {}): Promise<SyncResult> {
+    this.assertAcceptingWriteWork('sync');
     return this.indexMutex.withLock(async () => {
+      this.assertAcceptingWriteWork('sync');
       try {
         this.fileLock.acquire();
       } catch {

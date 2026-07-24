@@ -50,6 +50,7 @@ describe('offload-eval-metrics Evidence Header v1 metrics', () => {
 - Pending files: 0 (watcher current)
 - Deferred synthesis: dirty
 - Relationships: exact=7, heuristic=2, ambiguous=1, unresolved=3
+- Relationship gap scope: query-matched entry references
 - Candidate files: rendered=3, omitted=4
 - Coverage: partial — one ambiguous boundary
 
@@ -87,6 +88,7 @@ Found 10 symbols across 7 files.`,
         heuristicEdges: 2,
         ambiguousRelationships: 1,
         unresolvedRelationships: 3,
+        relationshipGapScope: 'query-matched entry references',
         renderedFiles: 3,
         omittedFiles: 4,
         coverage: 'partial',
@@ -113,6 +115,7 @@ Found 10 symbols across 7 files.`,
       heuristicEdges: 2,
       ambiguousRelationships: 1,
       unresolvedRelationships: 3,
+      relationshipGapScope: 'query-matched entry references',
       renderedFiles: 3,
       omittedFiles: 4,
       coverage: 'partial',
@@ -148,6 +151,7 @@ Found 10 symbols across 7 files.`,
 - Pending files: 0
 - Deferred synthesis: fresh
 - Relationships: exact=2, heuristic=0, ambiguous=0, unresolved=0
+- Relationship gap scope: query-matched entry references
 - Candidate files: rendered=1, omitted=0
 - Coverage: ${coverage}`;
     const out = extract([
@@ -193,6 +197,7 @@ Found 10 symbols across 7 files.`,
           heuristicEdges: 0,
           ambiguousRelationships: 0,
           unresolvedRelationships: 0,
+          relationshipGapScope: 'query-matched entry references',
           renderedFiles: 1,
           omittedFiles: 0,
           coverage: 'focused',
@@ -214,6 +219,7 @@ Found 10 symbols across 7 files.`,
           heuristicEdges: 0,
           ambiguousRelationships: 0,
           unresolvedRelationships: 0,
+          relationshipGapScope: 'query-matched entry references',
           renderedFiles: 1,
           omittedFiles: 0,
           coverage: 'qualified',
@@ -260,5 +266,43 @@ Found 10 symbols across 7 files.`,
     expect(out.evidenceHeader.exactEdges).toBeNull();
     expect(out.evidenceHeader.ambiguousRelationships).toBeNull();
     expect(out.evidenceHeader.unresolvedRelationships).toBeNull();
+  });
+
+  it('preserves the complete bounded explore answer for confidence judging', () => {
+    const tailMarker = 'GROUND_TRUTH_MAJOR_HOP_AT_THE_END';
+    const out = extract([
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', id: 'explore-1', name: 'codegraph_explore', input: { query: 'flow' } },
+          ],
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'explore-1',
+            content: `## Evidence Header v1
+- Index freshness: current
+- Pending files: 0
+- Deferred synthesis: fresh
+- Relationships: exact=2, heuristic=0, ambiguous=0, unresolved=0
+- Relationship gap scope: query-matched entry references
+- Candidate files: rendered=1, omitted=0
+- Coverage: qualified — relationship-gap counts are scoped
+
+${'x'.repeat(7000)}
+${tailMarker}`,
+          }],
+        },
+      },
+      { type: 'result', subtype: 'success', duration_ms: 20, num_turns: 1, result: 'done' },
+    ]);
+
+    expect(out.evidenceAnswers[0].answer.length).toBeGreaterThan(6000);
+    expect(out.evidenceAnswers[0].answer).toContain(tailMarker);
   });
 });

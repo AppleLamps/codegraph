@@ -164,7 +164,14 @@ export class MCPEngine {
     try {
       // Close any previously failed instance to avoid leaking resources.
       if (this.cg) {
-        try { this.cg.close(); } catch { /* ignore */ }
+        try {
+          this.cg.close();
+        } catch {
+          // A synchronous retry cannot drain active work safely. Keep the
+          // existing instance reachable and let the next retry run after that
+          // work settles instead of leaking it and opening a second connection.
+          return;
+        }
         this.cg = null;
       }
       this.cg = loadCodeGraph().openSync(resolvedRoot);

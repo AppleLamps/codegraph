@@ -163,7 +163,10 @@ function countListeningLines(root: string): number {
 
 function killTree(...procs: ChildProcessWithoutNullStreams[]): void {
   for (const p of procs) {
-    if (!p.killed) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
+    // `killed` only means a signal was sent; it does not mean the process has
+    // exited. Tests intentionally signal some proxies before teardown, so use
+    // the actual exit state and re-signal any process still alive.
+    if (p.exitCode === null) { try { p.kill('SIGKILL'); } catch { /* gone */ } }
   }
 }
 
@@ -184,17 +187,30 @@ describe('Shared MCP daemon (issue #411)', () => {
   });
 
   afterEach(async () => {
-    killTree(...servers.map((s) => s.child));
+    // Capture the detached daemon before killing its last proxy. That disconnect
+    // can make the daemon remove its pidfile while it is still draining handles,
+    // leaving teardown unable to find (and await) the process that owns tempDir.
+    const daemonPid = readLockPid(realRoot);
+    const children = servers.map((s) => s.child);
+    killTree(...children);
+    await Promise.all(children.map((child) =>
+      child.pid ? waitProcessExit(child.pid, 2000) : Promise.resolve(true)
+    ));
     // The daemon is detached (not a tracked child) — reap it explicitly via the
     // pid it recorded, so a test can't leak a background daemon. Guard against
     // our own pid: the version-mismatch test plants `pid: process.pid` in the
     // lockfile, and we must never SIGKILL the vitest worker.
-    const daemonPid = readLockPid(realRoot);
     if (daemonPid && daemonPid !== process.pid && isAlive(daemonPid)) {
       try { process.kill(daemonPid, 'SIGKILL'); } catch { /* race */ }
+      await waitProcessExit(daemonPid, 2000);
     }
-    await new Promise((r) => setTimeout(r, 50));
     servers.length = 0;
+    // Windows releases process cwd/database handles asynchronously even after
+    // the process has exited. Node's recursive-rm retries do not cover the
+    // top-level cwd EPERM, so give the kernel a bounded handoff window first.
+    if (process.platform === 'win32') {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 

@@ -63,6 +63,9 @@ describe('codegraph_explore Evidence Header v1', () => {
     expect(evidenceLine(text, 'Relationships')).toMatch(
       /^exact=\d+, heuristic=\d+, ambiguous=0, unresolved=0$/,
     );
+    expect(evidenceLine(text, 'Relationship gap scope')).toBe(
+      'query-matched entry references',
+    );
     expect(evidenceLine(text, 'Candidate files')).toMatch(/^rendered=\d+, omitted=\d+$/);
     expect(evidenceLine(text, 'Coverage')).toMatch(
       /^qualified — .*ranked retrieval is not proof of whole-repository completeness$/,
@@ -161,5 +164,32 @@ describe('codegraph_explore Evidence Header v1', () => {
     expect(evidenceLine(text, 'Coverage')).toMatch(
       /^partial — deferred synthesis is dirty/,
     );
+  });
+
+  it('still emits a conservative evidence header when retrieval finds no code', async () => {
+    const originalFind = cg.findRelevantContext.bind(cg);
+    (cg as any).findRelevantContext = async () => ({
+      nodes: new Map(),
+      edges: [],
+      roots: [],
+    });
+
+    const result = await handler.execute('codegraph_explore', {
+      query: 'definitelyMissingSymbol',
+    });
+    const text = result.content[0].text;
+
+    expect(text).toContain('## Evidence Header v1');
+    expect(evidenceLine(text, 'Relationships')).toBe(
+      'exact=0, heuristic=0, ambiguous=0, unresolved=0',
+    );
+    expect(evidenceLine(text, 'Candidate files')).toBe('rendered=0, omitted=0');
+    expect(evidenceLine(text, 'Coverage')).toMatch(
+      /^partial — no relevant code matched the query/,
+    );
+    expect(text).toContain('No relevant code found for "definitelyMissingSymbol"');
+    expect(result).not.toHaveProperty('_exploreEvidence');
+
+    (cg as any).findRelevantContext = originalFind;
   });
 });

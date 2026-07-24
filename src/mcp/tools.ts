@@ -512,8 +512,10 @@ interface ExploreEvidence {
   heuristicEdges: number;
   ambiguousRelationships: number;
   unresolvedRelationships: number;
+  relationshipGapScope: 'query-matched entry references';
   candidateFiles: string[];
   renderedFiles: string[];
+  noRelevantCode?: boolean;
 }
 
 /**
@@ -1341,6 +1343,7 @@ export class ToolHandler {
 
     const partialReasons: string[] = [];
     const qualifiedReasons: string[] = [];
+    if (evidence.noRelevantCode) partialReasons.push('no relevant code matched the query');
     if (degraded) partialReasons.push('live watching is degraded');
     if (pendingInScope > 0) {
       partialReasons.push(`${pendingInScope} ranked candidate file${pendingInScope === 1 ? ' is' : 's are'} pending sync`);
@@ -1361,6 +1364,7 @@ export class ToolHandler {
     if (evidence.heuristicEdges > 0) {
       qualifiedReasons.push(`${evidence.heuristicEdges} relationship${evidence.heuristicEdges === 1 ? ' is' : 's are'} heuristic`);
     }
+    qualifiedReasons.push('relationship-gap counts cover query-matched entry references only');
 
     let coverage: 'focused' | 'qualified' | 'partial';
     let coverageReason: string;
@@ -1382,6 +1386,7 @@ export class ToolHandler {
       `- Pending files: ${pendingLine}`,
       `- Deferred synthesis: ${synthesis}`,
       `- Relationships: exact=${evidence.exactEdges}, heuristic=${evidence.heuristicEdges}, ambiguous=${evidence.ambiguousRelationships}, unresolved=${evidence.unresolvedRelationships}`,
+      `- Relationship gap scope: ${evidence.relationshipGapScope}`,
       `- Candidate files: rendered=${renderedSet.size}, omitted=${omitted}`,
       `- Coverage: ${coverage} — ${coverageReason}`,
     ].join('\n');
@@ -2663,7 +2668,19 @@ export class ToolHandler {
     });
 
     if (subgraph.nodes.size === 0) {
-      return this.textResult(`No relevant code found for "${query}"`);
+      return {
+        ...this.textResult(`No relevant code found for "${query}"`),
+        _exploreEvidence: {
+          exactEdges: 0,
+          heuristicEdges: 0,
+          ambiguousRelationships: 0,
+          unresolvedRelationships: 0,
+          relationshipGapScope: 'query-matched entry references',
+          candidateFiles: [],
+          renderedFiles: [],
+          noRelevantCode: true,
+        },
+      };
     }
 
     // Graph-aware glue: findRelevantContext builds the subgraph from name/text
@@ -3406,9 +3423,14 @@ export class ToolHandler {
         // co-named method WHEN this file DEFINES the family supertype (so the base
         // `SQLCompiler.as_sql` body shows, but the 110 leaf `as_sql` overrides — and
         // OkHttp's 5 `intercept`s if the agent names `intercept` — stay signatures).
+        // A uniquely named callable is the strongest evidence of what the agent
+        // explicitly asked to inspect. Reserve the first body slot for it before
+        // filling the remaining cap with the flow spine; otherwise one large
+        // on-spine method can consume the cap and reduce the exact requested
+        // method to a signature (which immediately forces a follow-up lookup).
         const prio = (n: Node) => !CALLABLE_BODY.has(n.kind) ? 99
-          : flow.pathNodeIds.has(n.id) ? 0
-          : flow.uniqueNamedNodeIds.has(n.id) ? 1
+          : flow.uniqueNamedNodeIds.has(n.id) ? 0
+          : flow.pathNodeIds.has(n.id) ? 1
           : (fileDefinesSuper && flow.namedNodeIds.has(n.id)) ? 2 : 99;
         // One ~250-line WINDOW per file. syms are taken by priority (spine first,
         // then uniquely-named, then family-base), and the cap applies to ALL of
@@ -3919,6 +3941,7 @@ export class ToolHandler {
         heuristicEdges: heuristicEdgeCount,
         ambiguousRelationships: ambiguousRelationshipCount,
         unresolvedRelationships: unresolvedRelationshipCount,
+        relationshipGapScope: 'query-matched entry references',
         candidateFiles: sortedFiles.map(([filePath]) => filePath),
         renderedFiles: survivors,
       },

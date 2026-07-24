@@ -71,6 +71,7 @@ const parseEvidenceHeader = (text) => {
     unresolvedRelationships: relationships ? Number(relationships[4]) : null,
     renderedFiles: files ? Number(files[1]) : null,
     omittedFiles: files ? Number(files[2]) : null,
+    relationshipGapScope: line('Relationship gap scope'),
     coverage,
     coverageDetail: coverageLine,
   };
@@ -127,7 +128,11 @@ for (const line of lines) {
         activeCompletedExplore = {
           toolUseId: matchedExploreCall ? b.tool_use_id : null,
           evidenceHeader: header,
-          answer: text.slice(0, 6000),
+          // Explore already enforces its own bounded inline ceiling. Preserve
+          // the complete evidence so the confidence judge sees source/hops
+          // rendered after the first few kilobytes instead of grading a
+          // different, truncated answer.
+          answer: text,
           readFiles: [],
         };
         completedExplores.push(activeCompletedExplore);

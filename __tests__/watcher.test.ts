@@ -800,6 +800,73 @@ describe('FileWatcher', () => {
       expect(closed).toBe(true);
     });
 
+    it('closeAsync also waits for a library-initiated sync', async () => {
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await cg.indexAll();
+
+      const internals = cg as any;
+      const originalSync = internals.orchestrator.sync.bind(internals.orchestrator);
+      let releaseSync!: () => void;
+      let syncStarted!: () => void;
+      const started = new Promise<void>((resolve) => { syncStarted = resolve; });
+      internals.orchestrator.sync = async () => {
+        syncStarted();
+        await new Promise<void>((resolve) => { releaseSync = resolve; });
+        return {
+          filesAdded: 0,
+          filesModified: 0,
+          filesRemoved: 0,
+          durationMs: 1,
+        };
+      };
+
+      const syncing = cg.sync();
+      await started;
+      let closed = false;
+      const closing = cg.closeAsync().then(() => { closed = true; });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(closed).toBe(false);
+
+      releaseSync();
+      await syncing;
+      await closing;
+      expect(closed).toBe(true);
+      internals.orchestrator.sync = originalSync;
+      cg = null;
+    });
+
+    it('synchronous close refuses to finalize SQLite while write work is active', async () => {
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await cg.indexAll();
+
+      const internals = cg as any;
+      let releaseSync!: () => void;
+      let syncStarted!: () => void;
+      const started = new Promise<void>((resolve) => { syncStarted = resolve; });
+      internals.orchestrator.sync = async () => {
+        syncStarted();
+        await new Promise<void>((resolve) => { releaseSync = resolve; });
+        return {
+          filesAdded: 0,
+          filesModified: 0,
+          filesRemoved: 0,
+          durationMs: 1,
+        };
+      };
+
+      const syncing = cg.sync();
+      await started;
+      expect(() => cg!.close()).toThrow(/closeAsync/);
+      releaseSync();
+      await syncing;
+      await cg.closeAsync();
+      cg = null;
+    });
+
     it('should auto-sync when files change while watching (real fs.watch end-to-end)', async () => {
       // The one test that exercises the genuine native watcher: a real file
       // write must propagate through fs.watch → debounce → sync into the graph.

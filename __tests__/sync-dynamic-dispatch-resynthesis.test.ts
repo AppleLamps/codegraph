@@ -359,6 +359,36 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     expect((cg as any).synthesisClosed).toBe(true);
     cg = null;
   });
+
+  it('closeAsync() waits for a deferred synthesis pass already in flight', async () => {
+    cg = await CodeGraph.init(dir);
+    await cg.indexAll();
+
+    const internals = cg as any;
+    let releaseSynthesis!: () => void;
+    let synthesisStarted!: () => void;
+    const started = new Promise<void>((resolve) => { synthesisStarted = resolve; });
+    internals.resolver.synthesizeDynamicDispatchEdges = async () => {
+      synthesisStarted();
+      await new Promise<void>((resolve) => { releaseSynthesis = resolve; });
+      return 0;
+    };
+
+    const synthesis = internals.runDeferredSynthesis();
+    await started;
+    let closed = false;
+    const closing = cg.closeAsync().then(() => { closed = true; });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(closed).toBe(false);
+    expect(internals.synthesisRunning).toBe(true);
+
+    releaseSynthesis();
+    await synthesis;
+    await closing;
+    expect(closed).toBe(true);
+    expect(internals.synthesisRunning).toBe(false);
+    cg = null;
+  });
 });
 
 describe('resolveSynthDebounceMs', () => {
