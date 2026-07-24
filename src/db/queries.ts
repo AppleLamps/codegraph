@@ -2257,6 +2257,40 @@ export class QueryBuilder {
   }
 
   /**
+   * References that still have no graph edge, scoped to specific files.
+   *
+   * Unlike getUnresolvedReferencesByFiles(), this includes both `pending`
+   * references (resolution has not completed) and `failed` references (resolution
+   * completed without a target). The latter are deliberately parked to avoid
+   * repeated resolver work, but remain known coverage gaps for agent answers.
+   */
+  getReferenceGapsByFiles(filePaths: string[]): UnresolvedReference[] {
+    if (filePaths.length === 0) return [];
+
+    const rows: UnresolvedRefRow[] = [];
+    for (let i = 0; i < filePaths.length; i += SQLITE_PARAM_CHUNK_SIZE) {
+      const chunk = filePaths.slice(i, i + SQLITE_PARAM_CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const chunkRows = this.db
+        .prepare(`SELECT * FROM unresolved_refs WHERE status IN ('pending', 'failed') AND file_path IN (${placeholders})`)
+        .all(...chunk) as UnresolvedRefRow[];
+      rows.push(...chunkRows);
+    }
+
+    return rows.map((row) => ({
+      fromNodeId: row.from_node_id,
+      referenceName: row.reference_name,
+      referenceKind: row.reference_kind as EdgeKind,
+      line: row.line,
+      column: row.col,
+      candidates: row.candidates ? safeJsonParse(row.candidates, undefined) : undefined,
+      filePath: row.file_path,
+      language: row.language as Language,
+      rowId: row.id,
+    }));
+  }
+
+  /**
    * Delete all unresolved references (after resolution)
    */
   clearUnresolvedReferences(): void {

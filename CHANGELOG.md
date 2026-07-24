@@ -9,6 +9,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- `codegraph_explore` now begins with a compact Evidence Header v1 that tells agents whether the index is live, pending, degraded, or a snapshot; whether deferred dynamic-dispatch enrichment is current; how many returned relationships are exact versus heuristic or unresolved; and how many ranked candidate files fit in the response. Its `focused`, `qualified`, or `partial` coverage verdict is deliberately conservative and never claims whole-repository completeness. The agent-evaluation harness now tracks Reads made after an explore and independently judges those confidence claims against verified ground truth.
+
 ### Fixes
 
 - Flow questions keep working as you edit. CodeGraph links call flows that cross dynamic dispatch — callbacks, observers, event emitters, React re-renders, JSX children — so an agent can trace "how does X reach Y" without falling back to reading files. Those links were only ever built during a full index, and editing a file silently dropped the ones starting in it, so the longer a session ran the more flows quietly stopped connecting. They are now rebuilt as you go: a one-off `codegraph sync` refreshes them before it returns, and while the file watcher is running a burst of edits settles into a single refresh instead of one per save. Set `CODEGRAPH_SYNTH_DEBOUNCE_MS` to change how long CodeGraph waits for the dust to settle (default 6 seconds).

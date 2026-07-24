@@ -23,6 +23,7 @@ import {
   TaskContext,
   BuildContextOptions,
   FindRelevantContextOptions,
+  UnresolvedReference,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
@@ -1262,6 +1263,22 @@ export class CodeGraph {
   }
 
   /**
+   * Current state of the deferred dynamic-dispatch enrichment pass.
+   *
+   * This is intentionally categorical: consumers need to know whether
+   * synthesized callback/framework edges are current, not infer scheduler
+   * internals from timers or metadata.
+   */
+  getDynamicDispatchState(): 'fresh' | 'scheduled' | 'running' | 'dirty' {
+    if (this.synthesisRunning) return 'running';
+    if (this.synthesisTimer) return 'scheduled';
+    if (this.synthesisDirty || this.queries.getMetadata(DYNAMIC_DISPATCH_DIRTY_KEY) === '1') {
+      return 'dirty';
+    }
+    return 'fresh';
+  }
+
+  /**
    * Resolves once the file watcher has installed its watch set. Useful for
    * tests that need a deterministic boundary before asserting on
    * `getPendingFiles()`. Resolves immediately when no watcher is active.
@@ -1396,6 +1413,16 @@ export class CodeGraph {
    */
   getPendingReferenceCount(): number {
     return this.queries.getUnresolvedReferencesCount();
+  }
+
+  /**
+   * Known unresolved relationship gaps scoped to files in a query result.
+   * Agent-facing evidence uses this instead of the project-wide pending count
+   * so an unrelated unresolved symbol cannot make a focused answer look
+   * incomplete.
+   */
+  getRelationshipGapsForFiles(filePaths: string[]): UnresolvedReference[] {
+    return this.queries.getReferenceGapsByFiles(filePaths);
   }
 
   /**

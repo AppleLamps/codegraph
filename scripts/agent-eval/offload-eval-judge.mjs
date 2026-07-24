@@ -59,6 +59,26 @@ Judge: (1) is the traced call path correct vs ground truth? (2) are the cited fi
 Output ONLY minified JSON, no prose, no code fences:
 {"verdict":"pass|partial|fail","score":<0-100>,"fabrication":<true|false>,"coverageHonest":<true|false>,"missedHops":["..."],"note":"<=20 words"}`;
 
+const confidencePrompt = (gt, evidence) => `You are checking whether CodeGraph's Evidence Header v1 coverage claim is calibrated to the source evidence it returned and the verified ground truth. Do NOT use any tools.
+
+QUESTION: ${gt.question}
+
+VERIFIED GROUND TRUTH (the actual call path + files):
+${gt.truth}
+
+CODEGRAPH EVIDENCE OUTPUT:
+${evidence.answer || '(empty)'}
+
+CLAIMED COVERAGE: ${evidence.confidenceClaim || '(missing)'}
+
+Judge ONLY confidence calibration:
+- true: the coverage label honestly reflects whether the returned evidence contains the core ground-truth mechanism and major hops.
+- false: the label is overconfident (especially "focused" while missing a major hop) or contradicts known gaps in its own header.
+- null: no usable Evidence Header v1 coverage claim or insufficient output to judge.
+Remember that "focused" explicitly does NOT claim whole-repository completeness; do not mark it false merely for that disclaimer.
+Output ONLY minified JSON, no prose, no code fences:
+{"correct":<true|false|null>,"claim":"focused|qualified|partial|null","missedHops":["..."],"note":"<=20 words"}`;
+
 // Build the job list
 const jobs = [];
 for (const r of results) {
@@ -67,6 +87,13 @@ for (const r of results) {
   jobs.push({ r, kind: 'e2e', prompt: e2ePrompt(gt, r.finalAnswer) });
   if (r.arm === 'offload' && Array.isArray(r.offloadAnswers))
     r.offloadAnswers.forEach((ans, i) => { if (ans && ans.trim()) jobs.push({ r, kind: 'fid', idx: i, prompt: fidPrompt(gt, ans) }); });
+  if (Array.isArray(r.evidenceAnswers)) {
+    r.evidenceAnswers.forEach((evidence, i) => {
+      if (evidence?.answer?.trim()) {
+        jobs.push({ r, kind: 'confidence', idx: i, toolUseId: evidence.toolUseId, prompt: confidencePrompt(gt, evidence) });
+      }
+    });
+  }
 }
 console.error(`judging ${jobs.length} verdicts across ${results.length} runs (concurrency ${CONC})...`);
 
@@ -75,8 +102,15 @@ async function worker(queue) {
   while (queue.length) {
     const job = queue.shift();
     const v = await askJudge(job.prompt);
-    if (job.kind === 'e2e') job.r.e2e = v; else (job.r._fid ??= []).push(v);
-    console.error(`  [${++done}/${jobs.length}] ${job.r.repo}/${job.r.arm}#${job.r.rep} ${job.kind}: ${v.verdict}${v.score != null ? ' ' + v.score : ''}`);
+    if (job.kind === 'e2e') {
+      job.r.e2e = v;
+    } else if (job.kind === 'fid') {
+      (job.r._fid ??= []).push(v);
+    } else {
+      (job.r._confidence ??= []).push({ toolUseId: job.toolUseId, ...v });
+    }
+    const verdict = v.verdict ?? (typeof v.correct === 'boolean' ? String(v.correct) : 'unknown');
+    console.error(`  [${++done}/${jobs.length}] ${job.r.repo}/${job.r.arm}#${job.r.rep} ${job.kind}: ${verdict}${v.score != null ? ' ' + v.score : ''}`);
   }
 }
 const q = [...jobs];
@@ -97,7 +131,21 @@ for (const r of results) {
       verdicts: r._fid.map(v => v.verdict),
     };
   }
+  if (r._confidence?.length) {
+    const known = r._confidence.filter(v => typeof v.correct === 'boolean');
+    r.confidenceChecks = r._confidence;
+    r.confidenceCorrect = known.length === r._confidence.length
+      ? known.every(v => v.correct === true)
+      : null;
+    if (Array.isArray(r.followUpReadsByExplore)) {
+      for (const explore of r.followUpReadsByExplore) {
+        const verdict = r._confidence.find(v => v.toolUseId === explore.toolUseId);
+        explore.confidenceCorrect = typeof verdict?.correct === 'boolean' ? verdict.correct : null;
+      }
+    }
+  }
   delete r._fid;
+  delete r._confidence;
 }
 writeFileSync(OUT, results.map(r => JSON.stringify(r)).join('\n') + '\n');
 console.error(`wrote ${OUT}`);

@@ -54,6 +54,8 @@ import { resolve as resolvePath } from 'path';
 
 /** Maximum output length to prevent context bloat (characters) */
 const MAX_OUTPUT_LENGTH = 15000;
+/** Space reserved under the host's ~25K inline-result ceiling for Evidence Header v1. */
+const EVIDENCE_HEADER_RESERVE = 1200;
 
 /**
  * Maximum length for free-form string inputs (query, task, symbol).
@@ -496,6 +498,22 @@ export interface ToolResult {
     text: string;
   }>;
   isError?: boolean;
+  /**
+   * Internal evidence gathered by codegraph_explore. The main-thread dispatcher
+   * consumes this after worker-pool execution so watcher-backed freshness can be
+   * combined with query-local graph evidence. It is removed before the MCP
+   * response is returned.
+   */
+  _exploreEvidence?: ExploreEvidence;
+}
+
+interface ExploreEvidence {
+  exactEdges: number;
+  heuristicEdges: number;
+  ambiguousRelationships: number;
+  unresolvedRelationships: number;
+  candidateFiles: string[];
+  renderedFiles: string[];
 }
 
 /**
@@ -679,7 +697,7 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: 'codegraph_explore',
-    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
+    description: 'PRIMARY TOOL — call FIRST for almost any question OR before an edit: how does X work, architecture, a bug, where/what is X, surveying an area, or the symbols you are about to change. Returns the verbatim source of the relevant symbols grouped by file in ONE capped call (Read-equivalent — treat the shown source as already Read; do NOT re-open those files), plus the call path among them. Every response begins with Evidence Header v1: freshness, deferred-synthesis state, exact/heuristic/ambiguous/unresolved relationship counts, rendered/omitted candidates, and an honest focused/qualified/partial coverage verdict. Query can be a natural-language question OR a bag of symbol/file names. Usually the ONLY call you need — more accurate context, in far fewer tokens and round-trips than a search/Read/Grep loop.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1253,6 +1271,131 @@ export class ToolHandler {
   }
 
   /**
+   * Resolve the instance that owns live watcher state for a tool call. Explicit
+   * projectPath calls normally use a watcher-less cached reader; when that path
+   * is the default project, prefer the watched main instance.
+   */
+  private graphForLiveState(projectPath?: string): CodeGraph | null {
+    let cg: CodeGraph;
+    try {
+      cg = this.getCodeGraph(projectPath);
+    } catch {
+      return null;
+    }
+
+    if (this.cg && cg !== this.cg) {
+      try {
+        const sameProject =
+          resolvePath(this.cg.getProjectRoot()) === resolvePath(cg.getProjectRoot());
+        if (sameProject) cg = this.cg;
+      } catch {
+        /* A closed instance has no usable live state; keep the resolved reader. */
+      }
+    }
+    return cg;
+  }
+
+  /**
+   * Materialize Evidence Header v1 for codegraph_explore. Query-local evidence
+   * is gathered in the worker-safe handler; freshness is added here on the main
+   * thread because only the default instance owns the live watcher.
+   */
+  private withEvidenceHeader(result: ToolResult, projectPath?: string): ToolResult {
+    const evidence = result._exploreEvidence;
+    if (!evidence || result.isError) return result;
+
+    const cg = this.graphForLiveState(projectPath);
+    let watching = false;
+    let degraded = false;
+    let pending: PendingFile[] = [];
+    let synthesis: 'fresh' | 'scheduled' | 'running' | 'dirty' = 'dirty';
+    if (cg) {
+      try { watching = cg.isWatching(); } catch { /* snapshot below */ }
+      try { degraded = cg.isWatcherDegraded(); } catch { /* snapshot below */ }
+      try { pending = cg.getPendingFiles(); } catch { /* unknown below */ }
+      try { synthesis = cg.getDynamicDispatchState(); } catch { /* conservative dirty */ }
+    }
+
+    const freshness = degraded
+      ? 'degraded'
+      : pending.length > 0
+        ? 'pending'
+        : watching
+          ? 'current'
+          : 'snapshot';
+    const pendingLine = degraded
+      ? 'unknown (watcher degraded)'
+      : watching
+        ? `${pending.length}${pending.length > 0
+          ? ` (${pending.filter((p) => p.indexing).length} indexing; ${pending.slice(0, 3).map((p) => {
+            const normalized = p.path.replace(/\\/g, '/');
+            return normalized.length > 80 ? `…${normalized.slice(-79)}` : normalized;
+          }).join(', ')}${pending.length > 3 ? ', …' : ''})`
+          : ''}`
+        : 'unknown (live watcher unavailable)';
+
+    const candidateSet = new Set(evidence.candidateFiles);
+    const renderedSet = new Set(evidence.renderedFiles);
+    const omitted = [...candidateSet].filter((file) => !renderedSet.has(file)).length;
+    const pendingInScope = pending.filter((file) => candidateSet.has(file.path)).length;
+
+    const partialReasons: string[] = [];
+    const qualifiedReasons: string[] = [];
+    if (degraded) partialReasons.push('live watching is degraded');
+    if (pendingInScope > 0) {
+      partialReasons.push(`${pendingInScope} ranked candidate file${pendingInScope === 1 ? ' is' : 's are'} pending sync`);
+    } else if (pending.length > 0) {
+      qualifiedReasons.push(`${pending.length} pending file${pending.length === 1 ? ' is' : 's are'} outside the ranked candidates`);
+    }
+    if (synthesis !== 'fresh') partialReasons.push(`deferred synthesis is ${synthesis}`);
+    if (evidence.ambiguousRelationships > 0) {
+      partialReasons.push(`${evidence.ambiguousRelationships} ambiguous relationship${evidence.ambiguousRelationships === 1 ? '' : 's'}`);
+    }
+    if (evidence.unresolvedRelationships > 0) {
+      partialReasons.push(`${evidence.unresolvedRelationships} unresolved relationship${evidence.unresolvedRelationships === 1 ? '' : 's'}`);
+    }
+    if (omitted > 0) {
+      partialReasons.push(`${omitted} ranked candidate file${omitted === 1 ? ' was' : 's were'} not rendered`);
+    }
+    if (freshness === 'snapshot') qualifiedReasons.push('live freshness is unavailable');
+    if (evidence.heuristicEdges > 0) {
+      qualifiedReasons.push(`${evidence.heuristicEdges} relationship${evidence.heuristicEdges === 1 ? ' is' : 's are'} heuristic`);
+    }
+
+    let coverage: 'focused' | 'qualified' | 'partial';
+    let coverageReason: string;
+    if (partialReasons.length > 0) {
+      coverage = 'partial';
+      coverageReason = partialReasons.join('; ');
+    } else if (qualifiedReasons.length > 0) {
+      coverage = 'qualified';
+      coverageReason = qualifiedReasons.join('; ');
+    } else {
+      coverage = 'focused';
+      coverageReason = 'all ranked candidates rendered with no known relationship gaps';
+    }
+    coverageReason += '; ranked retrieval is not proof of whole-repository completeness';
+
+    const header = [
+      '## Evidence Header v1',
+      `- Index freshness: ${freshness}`,
+      `- Pending files: ${pendingLine}`,
+      `- Deferred synthesis: ${synthesis}`,
+      `- Relationships: exact=${evidence.exactEdges}, heuristic=${evidence.heuristicEdges}, ambiguous=${evidence.ambiguousRelationships}, unresolved=${evidence.unresolvedRelationships}`,
+      `- Candidate files: rendered=${renderedSet.size}, omitted=${omitted}`,
+      `- Coverage: ${coverage} — ${coverageReason}`,
+    ].join('\n');
+
+    const [first, ...rest] = result.content;
+    const { _exploreEvidence: _consumed, ...publicResult } = result;
+    if (!first || first.type !== 'text') return publicResult;
+    return {
+      ...publicResult,
+      content: [{ type: 'text', text: `${header}\n\n${first.text}` }, ...rest],
+    };
+  }
+
+  /**
    * Annotate a successful read-tool result with per-file staleness — the
    * non-blocking answer to issue #403. The file watcher tracks every event
    * it sees per path; here we intersect "files referenced in this response"
@@ -1268,29 +1411,8 @@ export class ToolHandler {
   private withStalenessNotice(result: ToolResult, projectPath?: string): ToolResult {
     if (result.isError) return result;
 
-    let cg: CodeGraph;
-    try {
-      cg = this.getCodeGraph(projectPath);
-    } catch {
-      return result; // no default project — leave as is
-    }
-
-    // Cross-project `projectPath` calls open a cached CodeGraph WITHOUT a
-    // watcher (watchers are only attached to the default session project).
-    // When the cross-project path happens to be the same project as the
-    // default cg, the cached instance is the wrong one — its pendingFiles is
-    // permanently empty. Detect the equal-path case and prefer the default
-    // cg so the staleness signal still fires when an agent passes the
-    // explicit projectPath form of its own project.
-    if (this.cg && cg !== this.cg) {
-      try {
-        const sameProject =
-          resolvePath(this.cg.getProjectRoot()) === resolvePath(cg.getProjectRoot());
-        if (sameProject) cg = this.cg;
-      } catch {
-        /* getProjectRoot may throw on a closed instance — leave cg as is */
-      }
-    }
+    const cg = this.graphForLiveState(projectPath);
+    if (!cg) return result; // no default project — leave as is
 
     // Whole-index degradation (#876): once live watching has permanently
     // stopped, getPendingFiles() is empty so the per-file banner below can't
@@ -1424,7 +1546,8 @@ export class ToolHandler {
       const result = (this.queryPool && this.queryPool.healthy && this.queryPool.ready)
         ? await this.queryPool.run(toolName, args)
         : await this.executeReadTool(toolName, args);
-      const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
+      const withEvidence = this.withEvidenceHeader(result, args.projectPath as string | undefined);
+      const withWorktree = this.withWorktreeNotice(withEvidence, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
       // Expected condition, not a malfunction: answer as a SUCCESS so the
@@ -3055,7 +3178,58 @@ export class ToolHandler {
     // Relationship map — show how symbols connect
     const significantEdges = subgraph.edges.filter(e =>
       e.kind !== 'contains' // skip contains — it's implied by file grouping
+      && subgraph.nodes.has(e.source)
+      && subgraph.nodes.has(e.target)
     );
+    const heuristicEdgeCount = significantEdges.filter((edge) =>
+      edge.provenance === 'heuristic'
+      || (
+        typeof edge.metadata === 'object'
+        && edge.metadata !== null
+        && typeof (edge.metadata as Record<string, unknown>).synthesizedBy === 'string'
+      )
+    ).length;
+    const exactEdgeCount = significantEdges.length - heuristicEdgeCount;
+
+    // Relationship gaps are scoped to the query's entry nodes (search roots +
+    // explicitly named symbols), not every incidental node gathered from their
+    // files. Large source files contain hundreds of unrelated failed refs
+    // (external APIs, built-ins); counting those made every focused answer look
+    // catastrophically incomplete even when its requested symbols were clean.
+    let ambiguousRelationshipCount = 0;
+    let unresolvedRelationshipCount = 0;
+    try {
+      const candidatePaths = sortedFiles.map(([filePath]) => filePath);
+      const relationshipNames = new Set<string>();
+      for (const id of namedSeedIds) {
+        const node = subgraph.nodes.get(id);
+        if (node) relationshipNames.add(normalizeNameToken(node.name));
+      }
+      for (const token of query.split(/[\s,()[\]]+/)) {
+        // A precise symbol-shaped token can name a missing target even though no
+        // node exists to seed. Bare natural-language words are excluded: their
+        // collisions with common methods (`get`, `run`, `map`) otherwise turn
+        // hundreds of unrelated failed refs into apparent query gaps.
+        const precise = /[._$]|::|\//.test(token)
+          || /[a-z][A-Z]/.test(token)
+          || /^[A-Z]/.test(token);
+        if (!precise) continue;
+        const normalized = normalizeNameToken(token);
+        if (normalized) relationshipNames.add(normalized);
+      }
+      const pendingRefs = cg.getRelationshipGapsForFiles(candidatePaths)
+        .filter((ref) =>
+          entryNodeIds.has(ref.fromNodeId)
+          && relationshipNames.has(normalizeNameToken(ref.referenceName))
+        );
+      for (const ref of pendingRefs) {
+        if ((ref.candidates?.length ?? 0) > 1) ambiguousRelationshipCount++;
+        else unresolvedRelationshipCount++;
+      }
+    } catch {
+      // Older/partial embedded facades may not expose scoped pending refs.
+      // Zero means "no known gap in this result", never "proved complete".
+    }
 
     if (budget.includeRelationships && significantEdges.length > 0) {
       lines.push('**Relationships**');
@@ -3697,7 +3871,10 @@ export class ToolHandler {
     // externalize territory.
     const output = flow.text + lines.join('\n');
 
-    const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
+    const hardCeiling = Math.min(
+      Math.round(budget.maxOutputChars * 1.5),
+      25000 - EVIDENCE_HEADER_RESERVE,
+    );
     let finalText: string;
     if (output.length > hardCeiling) {
       // Cut at a FILE-SECTION boundary (the last ``**` `` file header before the
@@ -3735,7 +3912,17 @@ export class ToolHandler {
       : `Found ${subgraph.nodes.size} symbol${subgraph.nodes.size === 1 ? '' : 's'} across ${fileGroups.size} file${fileGroups.size === 1 ? '' : 's'}.`;
     finalText = finalText.replace(SUMMARY_SENTINEL, summaryLine);
 
-    return this.textResult(finalText);
+    return {
+      ...this.textResult(finalText),
+      _exploreEvidence: {
+        exactEdges: exactEdgeCount,
+        heuristicEdges: heuristicEdgeCount,
+        ambiguousRelationships: ambiguousRelationshipCount,
+        unresolvedRelationships: unresolvedRelationshipCount,
+        candidateFiles: sortedFiles.map(([filePath]) => filePath),
+        renderedFiles: survivors,
+      },
+    };
   }
 
   /**
