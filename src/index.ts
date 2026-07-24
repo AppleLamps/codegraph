@@ -132,6 +132,24 @@ export interface IndexOptions {
 }
 
 /**
+ * Quiet period before a watcher-driven sync's deferred dynamic-dispatch
+ * re-synthesis fires. Deliberately longer than the watcher's own debounce
+ * (2000ms, see sync/watcher.ts) so a burst of edits — an agent applying a
+ * multi-file change — collapses into ONE whole-graph pass after the tree
+ * settles instead of one per save. Override with CODEGRAPH_SYNTH_DEBOUNCE_MS.
+ */
+const DEFAULT_SYNTH_DEBOUNCE_MS = 6000;
+
+/** Parse CODEGRAPH_SYNTH_DEBOUNCE_MS, falling back on anything non-numeric. */
+export function resolveSynthDebounceMs(raw: string | undefined): number {
+  // `Number('')` is 0, so an empty/whitespace value has to be rejected before
+  // the numeric check or an unset-but-present env var would mean "no debounce".
+  if (raw === undefined || raw.trim() === '') return DEFAULT_SYNTH_DEBOUNCE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SYNTH_DEBOUNCE_MS;
+}
+
+/**
  * Main CodeGraph class
  *
  * Provides the primary interface for interacting with the code knowledge graph.
@@ -151,6 +169,13 @@ export class CodeGraph {
 
   // Mutex for preventing concurrent indexing operations (in-process)
   private indexMutex = new Mutex();
+
+  // Deferred dynamic-dispatch re-synthesis state. See
+  // scheduleDynamicDispatchSynthesis / runDeferredSynthesis.
+  private synthesisTimer: ReturnType<typeof setTimeout> | null = null;
+  private synthesisDirty = false;
+  private synthesisRunning = false;
+  private synthesisClosed = false;
 
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
@@ -411,6 +436,14 @@ export class CodeGraph {
    * Close the CodeGraph instance and release resources
    */
   close(): void {
+    // Disarm deferred re-synthesis before the DB goes away — a timer that
+    // fired against a closed connection would throw from a bare setTimeout
+    // callback with no caller to catch it.
+    this.synthesisClosed = true;
+    if (this.synthesisTimer) {
+      clearTimeout(this.synthesisTimer);
+      this.synthesisTimer = null;
+    }
     this.unwatch();
     // Release file lock if held
     this.fileLock.release();
@@ -806,6 +839,9 @@ export class CodeGraph {
 
         // Resolve references if files were updated
         const filesChanged = result.filesAdded > 0 || result.filesModified > 0;
+        // Set by any branch that routes through resolveAndPersistBatched, which
+        // ends in the synthesis passes itself — no need to pay them twice.
+        let synthesizedByBatchedPass = false;
         if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
@@ -880,6 +916,7 @@ export class CodeGraph {
                 });
               }
             );
+            synthesizedByBatchedPass = true;
           }
         }
 
@@ -920,6 +957,7 @@ export class CodeGraph {
               });
             }
           );
+          synthesizedByBatchedPass = true;
         }
 
         if (filesChanged || orphanCount > 0) {
@@ -930,6 +968,28 @@ export class CodeGraph {
           // Same lifecycle for `this.<member>` callback registrations whose
           // member is inherited from a supertype (#808).
           await this.resolver.resolveDeferredThisMemberRefs();
+        }
+
+        // Refresh dynamic-dispatch (callback/observer/react-render/JSX) edges.
+        // Re-indexing a file deletes its nodes and every edge touching them
+        // FK-cascades away, provenance-blind — so each edit silently destroys
+        // the synthesized edges that let a flow question connect end-to-end,
+        // and nothing recreated them until the next full re-index. Coverage
+        // therefore decayed monotonically across an editing session, exactly
+        // when an agent is leaning on it hardest.
+        //
+        // The passes are whole-graph: their cost tracks REPO size, not change
+        // size, so a one-line edit in a big repo would otherwise pay the full
+        // pass on every save. When a watcher is driving syncs we hand off to a
+        // coalescing timer — a burst of edits costs ONE pass once the tree
+        // settles. A one-shot sync (CLI, library caller) has no later moment to
+        // run in and its caller is already waiting, so it pays inline.
+        if ((filesChanged || result.filesRemoved > 0) && !synthesizedByBatchedPass) {
+          if (this.isWatching()) {
+            this.scheduleDynamicDispatchSynthesis();
+          } else {
+            await this.runDynamicDispatchSynthesis(options.onProgress);
+          }
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -970,6 +1030,99 @@ export class CodeGraph {
    */
   isIndexing(): boolean {
     return this.indexMutex.isLocked();
+  }
+
+  // ===========================================================================
+  // Dynamic-dispatch re-synthesis
+  // ===========================================================================
+
+  /**
+   * Run the dynamic-dispatch synthesis passes now.
+   *
+   * Deliberately does NOT take either indexing lock — both callers already
+   * hold them (sync's inline path runs inside its `withLock` + file lock, the
+   * deferred path wraps this in its own), and the mutex is not reentrant, so
+   * acquiring it here would deadlock the inline path.
+   *
+   * Best-effort by design, matching the batched indexer's treatment: the edges
+   * are additive enrichment, so a failure degrades retrieval quality but must
+   * never fail the sync that triggered it.
+   */
+  private async runDynamicDispatchSynthesis(
+    onProgress?: (progress: IndexProgress) => void
+  ): Promise<void> {
+    try {
+      const t0 = Date.now();
+      await this.resolver.synthesizeDynamicDispatchEdges((done, totalPasses) => {
+        onProgress?.({ phase: 'linking', current: done, total: totalPasses });
+      });
+      if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+        console.error(`[phase-timing] sync-callback-synthesis: ${Date.now() - t0}ms`);
+      }
+    } catch {
+      // Synthesis is additive and optional; never fail a sync over it.
+    }
+  }
+
+  /**
+   * Mark the graph's synthesized edges stale and (re)arm the coalescing timer.
+   *
+   * Re-arming on every call is the coalescing: a burst of watcher syncs keeps
+   * pushing the deadline out, so the whole-graph pass runs once after the tree
+   * settles rather than once per save. The timer is `unref`'d so a pending
+   * re-synthesis never keeps a CLI process alive.
+   */
+  private scheduleDynamicDispatchSynthesis(): void {
+    if (this.synthesisClosed) return;
+    this.synthesisDirty = true;
+    if (this.synthesisTimer) clearTimeout(this.synthesisTimer);
+    this.synthesisTimer = setTimeout(() => {
+      this.synthesisTimer = null;
+      void this.runDeferredSynthesis();
+    }, resolveSynthDebounceMs(process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS));
+    this.synthesisTimer.unref?.();
+  }
+
+  /**
+   * Timer body for {@link scheduleDynamicDispatchSynthesis}.
+   *
+   * Takes the same in-process mutex AND cross-process project lock as
+   * sync/indexAll, so a re-synthesis cannot interleave its writes with either
+   * this instance or a CLI/MCP process. If another process owns the project
+   * lock, leave the graph dirty and retry after another quiet period.
+   */
+  private async runDeferredSynthesis(): Promise<void> {
+    if (this.synthesisClosed || this.synthesisRunning) return;
+    this.synthesisRunning = true;
+    try {
+      await this.indexMutex.withLock(async () => {
+        if (this.synthesisClosed) return;
+        try {
+          this.fileLock.acquire();
+        } catch {
+          // Cross-process contention is normal (for example, a CLI sync while
+          // the watcher is alive). Keep the obligation rather than either
+          // racing that writer or silently dropping the refresh.
+          this.synthesisDirty = true;
+          return;
+        }
+        try {
+          // Cleared only after both locks are held: any later schedule request
+          // is genuinely newer than the graph state this pass will read.
+          this.synthesisDirty = false;
+          await this.runDynamicDispatchSynthesis();
+        } finally {
+          this.fileLock.release();
+        }
+      });
+    } catch {
+      // withLock rejection (closing DB, etc.) — nothing to recover.
+    } finally {
+      this.synthesisRunning = false;
+    }
+    if (this.synthesisDirty && !this.synthesisClosed && this.isWatching()) {
+      this.scheduleDynamicDispatchSynthesis();
+    }
   }
 
   // ===========================================================================

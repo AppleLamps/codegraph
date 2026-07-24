@@ -151,9 +151,20 @@ excalidraw +3 nodes, no explosion, no regression.
    intentionally not extracted in Phase 3). The fix is **synthesizer link-through-body**:
    parse the arrow's body and link `dispatcher → (calls inside the arrow)`. Highest
    remaining recall win; handles the most common modern callback shape.
-2. **Wire into `resolveAndPersist`** (incremental sync) — synthesis currently runs only
-   in `resolveAndPersistBatched` (full index). Incremental re-index won't refresh
-   synthesized edges.
+2. ~~**Wire into `resolveAndPersist`** (incremental sync)~~ — **DONE.** Sync now refreshes
+   synthesized edges via `ReferenceResolver.synthesizeDynamicDispatchEdges()`, dispatched
+   from `CodeGraph.sync()`. The failure this fixed was worse than staleness: re-indexing a
+   file deletes its nodes and every edge touching them FK-cascades away, provenance-blind.
+   The #899 snapshot re-points cross-file *incoming* edges, so a synthesized edge whose
+   TARGET moved survived — but one whose **source** was in the edited file was destroyed,
+   and unlike a static edge no extractor re-emits it. Coverage therefore decayed to zero
+   over an editing session. Re-running is idempotent (INSERT OR IGNORE against the unique
+   `idx_edges_identity`), so no delete-before-insert step is needed. Because the passes are
+   whole-graph — cost tracks repo size, not change size — a watcher-driven sync defers to a
+   coalescing timer (`CODEGRAPH_SYNTH_DEBOUNCE_MS`, default 6s) while a one-shot sync pays
+   inline. Deferred passes take both the in-process mutex and the cross-process project
+   lock; lock contention preserves the dirty flag and schedules a retry instead of racing
+   a CLI/MCP writer. Coverage: `__tests__/sync-dynamic-dispatch-resynthesis.test.ts`.
 3. **Receiver-type matching** for EventEmitter precision (replace/augment the fan-out
    cap) — use `type_of` edges so `x.emit('change')` only links to `y.on('change', fn)`
    when `x`,`y` are the same type. Lets the fan-out cap relax.

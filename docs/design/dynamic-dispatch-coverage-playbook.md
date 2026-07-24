@@ -643,8 +643,16 @@ Status legend: ✅ done+validated · 🔬 hole identified · ⬜ not started.
 - **As-built shortcuts** (callback synthesizer): pairs registrar/dispatcher by *file*+field
   (class proxy), regex arg-recovery (named refs only), `provenance:'heuristic'` +
   `metadata.synthesizedBy` (the enum has no `'callback-synthesis'`). See the design doc.
-- **Synthesizer runs only in `resolveAndPersistBatched`** (full index) — wire into
-  `resolveAndPersist` for incremental sync before shipping.
+- ~~**Synthesizer runs only in `resolveAndPersistBatched`** (full index)~~ — **fixed.**
+  `CodeGraph.sync()` now re-runs the passes (`synthesizeDynamicDispatchEdges`), inline for
+  a one-shot sync and on a coalescing timer (`CODEGRAPH_SYNTH_DEBOUNCE_MS`, default 6s)
+  when a watcher is driving them, since the passes are whole-graph and their cost tracks
+  repo size rather than change size. Before this, each edit CASCADE-deleted the synthesized
+  edges whose source was in the edited file (the #899 snapshot only re-points cross-file
+  *incoming* edges, and no extractor re-emits a synthesized one), so dynamic-dispatch
+  coverage decayed to zero across an editing session. Deferred passes take the same
+  in-process and cross-process locks as sync; project-lock contention keeps the refresh
+  dirty and re-arms the timer.
 - **Symbol ambiguity in `trace`:** common names (`render`, `execute_sql`) match many
   nodes; trace picks among them and may start from the wrong one. Trace from the specific
   method, not a class name.

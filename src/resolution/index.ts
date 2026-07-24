@@ -1206,6 +1206,33 @@ export class ReferenceResolver {
   }
 
   /**
+   * Run the dynamic-dispatch synthesis passes over the whole graph.
+   *
+   * Exposed separately from {@link resolveAndPersistBatched} (which runs it as
+   * its own last phase) so the INCREMENTAL sync path can refresh synthesized
+   * edges too. Sync must re-run this: re-indexing a file deletes its nodes, and
+   * every edge touching them FK-cascades away with them (`ON DELETE CASCADE`,
+   * schema.sql) — a provenance-blind delete, so the synthesized
+   * callback/observer/react-render edges that make flow questions connect
+   * end-to-end die with each edit. Nothing else recreates them, so before this
+   * the graph's dynamic-dispatch coverage decayed monotonically across an
+   * editing session until the next full re-index.
+   *
+   * Safe to re-run: `insertEdges` is INSERT OR IGNORE against the unique
+   * `idx_edges_identity`, so edges that survived the cascade are left alone and
+   * only the deleted ones come back — no duplicates, no delete-before-insert
+   * step needed. There is no resolver pool on this path (the pool is a
+   * full-index resource), so the passes run sequentially, yielding
+   * cooperatively exactly as they do under the batched caller so the #850
+   * liveness watchdog can't kill a long pass.
+   */
+  async synthesizeDynamicDispatchEdges(
+    onProgress?: (done: number, total: number) => void
+  ): Promise<number> {
+    return synthesizeCallbackEdges(this.queries, this.context, onProgress);
+  }
+
+  /**
    * Yielding counterpart of {@link resolveAndPersist} for a caller-supplied
    * ref list — used by sync's failed-ref retry pass (#1240). Same persistence
    * semantics: resolved refs become edges and their rows are deleted;
