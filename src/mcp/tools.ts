@@ -1140,6 +1140,14 @@ export class ToolHandler {
     this.worktreeMismatchCache.clear();
   }
 
+  /** Close all cached project connections after their watcher work drains. */
+  async closeAllAsync(): Promise<void> {
+    const projects = [...this.projectCache.values()];
+    this.projectCache.clear();
+    this.worktreeMismatchCache.clear();
+    await Promise.all(projects.map((cg) => cg.closeAsync()));
+  }
+
   /**
    * Validate that a value is a non-empty string within length bounds.
    *

@@ -112,6 +112,35 @@ describe('FileWatcher', () => {
 
       expect(watcher.isActive()).toBe(false);
     });
+
+    it('stopAndDrain waits for an in-flight sync before resolving', async () => {
+      let releaseSync!: () => void;
+      const syncStarted = vi.fn();
+      const syncFn = vi.fn(async () => {
+        syncStarted();
+        await new Promise<void>((resolve) => {
+          releaseSync = resolve;
+        });
+        return { filesChanged: 1, durationMs: 1 };
+      });
+      const watcher = newWatcher(syncFn, { debounceMs: 100 });
+      watcher.start();
+
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+      await waitFor(() => syncStarted.mock.calls.length === 1);
+
+      let drained = false;
+      const draining = watcher.stopAndDrain().then(() => {
+        drained = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(drained).toBe(false);
+
+      releaseSync();
+      await draining;
+      expect(drained).toBe(true);
+      expect(watcher.isActive()).toBe(false);
+    });
   });
 
   describe('watch-resource exhaustion (#876)', () => {
@@ -506,8 +535,8 @@ describe('FileWatcher', () => {
       expect(after).toContain('root.ts');
       expect(after.some((p) => p.startsWith('docs/'))).toBe(false);
 
-      watcher.stop();
-      cg.close();
+      await watcher.stopAndDrain();
+      await cg.closeAsync();
     });
 
     it('should ignore .codegraph directory changes', async () => {
@@ -701,8 +730,8 @@ describe('FileWatcher', () => {
   describe('CodeGraph integration', () => {
     let cg: CodeGraph;
 
-    afterEach(() => {
-      if (cg) cg.close();
+    afterEach(async () => {
+      if (cg) await cg.closeAsync();
     });
 
     it('should watch and unwatch via CodeGraph API', async () => {
@@ -717,7 +746,7 @@ describe('FileWatcher', () => {
       expect(started).toBe(true);
       expect(cg.isWatching()).toBe(true);
 
-      cg.unwatch();
+      await cg.unwatchAsync();
       expect(cg.isWatching()).toBe(false);
     });
 
@@ -734,6 +763,41 @@ describe('FileWatcher', () => {
       // After close, isWatching should be false
       // (we can't call isWatching after close since DB is closed,
       //  but we verify no errors are thrown)
+    });
+
+    it('closeAsync keeps SQLite open until an in-flight watcher sync drains', async () => {
+      cg = CodeGraph.initSync(testDir, {
+        config: { include: ['**/*.ts'], exclude: [] },
+      });
+      await cg.indexAll();
+      cg.watch({ debounceMs: 100, inertForTests: true });
+
+      const watcher = (cg as any).watcher;
+      let releaseSync!: () => void;
+      let syncStarted = false;
+      watcher.syncFn = async () => {
+        syncStarted = true;
+        await new Promise<void>((resolve) => {
+          releaseSync = resolve;
+        });
+        return { filesChanged: 1, durationMs: 1 };
+      };
+
+      __emitWatchEventForTests(testDir, 'src/index.ts');
+      await waitFor(() => syncStarted);
+
+      let closed = false;
+      const closing = cg.closeAsync().then(() => {
+        closed = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(closed).toBe(false);
+      // The connection remains usable while closeAsync waits at the barrier.
+      expect(cg.getStats().fileCount).toBeGreaterThan(0);
+
+      releaseSync();
+      await closing;
+      expect(closed).toBe(true);
     });
 
     it('should auto-sync when files change while watching (real fs.watch end-to-end)', async () => {
@@ -767,7 +831,7 @@ describe('FileWatcher', () => {
       const results = cg.searchNodes('added');
       expect(results.length).toBeGreaterThan(0);
 
-      cg.unwatch();
+      await cg.unwatchAsync();
     });
   });
 

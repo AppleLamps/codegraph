@@ -115,10 +115,10 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     cg = null;
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     if (priorDebounce === undefined) delete process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS;
     else process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = priorDebounce;
-    try { cg?.close(); } catch { /* already closed */ }
+    try { await cg?.closeAsync(); } catch { /* already closed */ }
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
@@ -127,7 +127,12 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     fs.writeFileSync(path.join(dir, 'Request.swift'), `${'// touched\n'.repeat(n)}${REQUEST_SWIFT}`);
   }
 
+  function touchRegistrar(n = 1): void {
+    fs.writeFileSync(path.join(dir, 'DataRequest.swift'), `${'// touched\n'.repeat(n)}${DATA_REQUEST_SWIFT}`);
+  }
+
   it('rebuilds a synthesized edge whose source file was re-indexed', async () => {
+    process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '100';
     cg = await CodeGraph.init(dir);
     await cg.indexAll();
 
@@ -140,6 +145,7 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     touchDispatcher();
     await cg.sync();
 
+    expect(await waitFor(() => validators(synthEdges(cg!)) !== undefined)).toBe(true);
     const after = validators(synthEdges(cg));
     expect(after).toBeTruthy();
     expect(after!.source_name).toBe('didCompleteTask');
@@ -153,7 +159,7 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     expect(synthEdges(cg).some((r) => r.field === 'handlers' && r.target_name === 'onEvent')).toBe(true);
   });
 
-  it('does not duplicate edges when the passes re-run (INSERT OR IGNORE identity)', async () => {
+  it('does not duplicate edges when synthesized identities are upserted', async () => {
     cg = await CodeGraph.init(dir);
     await cg.indexAll();
 
@@ -161,7 +167,7 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     expect(baseline).toBeGreaterThan(0);
 
     // Re-running whole-graph synthesis is the recovery mechanism, so it has to
-    // be idempotent — the unique idx_edges_identity + INSERT OR IGNORE is what
+    // be idempotent — the unique idx_edges_identity + synthesized-edge UPSERT
     // makes a delete-before-insert step unnecessary.
     const resolver = (cg as any).resolver;
     await resolver.synthesizeDynamicDispatchEdges();
@@ -171,6 +177,7 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
   });
 
   it('holds coverage flat across repeated edits instead of decaying', async () => {
+    process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '25';
     cg = await CodeGraph.init(dir);
     await cg.indexAll();
     const baseline = synthEdges(cg).length;
@@ -179,11 +186,35 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     for (let i = 1; i <= 3; i++) {
       touchDispatcher(i);
       await cg.sync();
+      expect(await waitFor(() => validators(synthEdges(cg!)) !== undefined)).toBe(true);
       const rows = synthEdges(cg);
       expect(rows.length).toBe(baseline);
       // …and still anchored to the dispatcher's current line, i lines lower.
       expect(validators(rows)!.line).toBe(7 + i);
     }
+  });
+
+  it('never runs repository-wide synthesis inline for a manual sync', async () => {
+    process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '600000';
+    cg = await CodeGraph.init(dir);
+    await cg.indexAll();
+
+    const internals = cg as any;
+    let synthesisCalls = 0;
+    const originalSynthesize = internals.resolver.synthesizeDynamicDispatchEdges.bind(internals.resolver);
+    internals.resolver.synthesizeDynamicDispatchEdges = async (...args: unknown[]) => {
+      synthesisCalls++;
+      return originalSynthesize(...args);
+    };
+
+    touchDispatcher();
+    await cg.sync();
+
+    expect(synthesisCalls).toBe(0);
+    expect(validators(synthEdges(cg))).toBeUndefined();
+    expect(internals.synthesisTimer).not.toBeNull();
+    expect(internals.queries.getMetadata('dynamic_dispatch_dirty')).toBe('1');
+    internals.resolver.synthesizeDynamicDispatchEdges = originalSynthesize;
   });
 
   it('defers instead of running inline while a watcher is driving syncs', async () => {
@@ -242,6 +273,39 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     expect((cg as any).synthesisRunning).toBe(false);
   });
 
+  it('a later watcher resumes a durable refresh left by a short-lived sync', async () => {
+    process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '600000';
+    cg = await CodeGraph.init(dir);
+    await cg.indexAll();
+    touchDispatcher();
+    await cg.sync();
+    expect((cg as any).queries.getMetadata('dynamic_dispatch_dirty')).toBe('1');
+    await cg.closeAsync();
+
+    process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '25';
+    cg = await CodeGraph.open(dir);
+    expect(cg.watch({ debounceMs: 3_600_000 })).toBe(true);
+
+    expect(await waitFor(() => validators(synthEdges(cg!)) !== undefined)).toBe(true);
+    expect((cg as any).queries.getMetadata('dynamic_dispatch_dirty')).toBe('0');
+  });
+
+  it('refreshes registeredAt when a surviving synthesized edge is rediscovered', async () => {
+    process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '25';
+    cg = await CodeGraph.init(dir);
+    await cg.indexAll();
+    expect(validators(synthEdges(cg))!.registeredAt).toBe('DataRequest.swift:4');
+
+    // Target-side reindexing preserves and repoints the incoming synthesized
+    // edge. Its identity survives, but the registrar line moves.
+    touchRegistrar();
+    await cg.sync();
+    expect(await waitFor(
+      () => validators(synthEdges(cg!))?.registeredAt === 'DataRequest.swift:5'
+    )).toBe(true);
+    expect(validators(synthEdges(cg))!.registeredAt).toBe('DataRequest.swift:5');
+  });
+
   it('retries instead of writing when another process owns the project lock', async () => {
     process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '600000';
     cg = await CodeGraph.init(dir);
@@ -278,7 +342,7 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     internals.resolver.synthesizeDynamicDispatchEdges = originalSynthesize;
   });
 
-  it('close() disarms a pending deferred pass', async () => {
+  it('closeAsync() disarms a pending deferred pass', async () => {
     process.env.CODEGRAPH_SYNTH_DEBOUNCE_MS = '600000';
     cg = await CodeGraph.init(dir);
     await cg.indexAll();
@@ -288,7 +352,7 @@ describe('dynamic-dispatch re-synthesis on sync', () => {
     await cg.sync();
     expect((cg as any).synthesisTimer).not.toBeNull();
 
-    cg.close();
+    await cg.closeAsync();
     // A timer left armed here would fire against a closed database from a bare
     // setTimeout callback, with no caller to catch the throw.
     expect((cg as any).synthesisTimer).toBeNull();

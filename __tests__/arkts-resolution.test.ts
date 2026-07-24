@@ -94,6 +94,7 @@ describe('ArkTS attribute-chain resolution precision', () => {
     const decoyHeight = fns.find((n) => n.name === 'height' && n.filePath.includes('Decoy'));
     expect(decoyHeight).toBeDefined();
     expect(cg.getIncomingEdges(decoyHeight!.id).filter((e) => e.kind === 'calls')).toHaveLength(0);
+    await cg.closeAsync();
   });
 });
 
@@ -163,6 +164,7 @@ describe('ArkTS ohpm workspace import resolution', () => {
     expect(addToCart).toBeDefined();
     const targets = cg.getOutgoingEdges(add!.id).map((e) => e.target);
     expect(targets).toContain(addToCart!.id);
+    await cg.closeAsync();
   });
 });
 
@@ -224,6 +226,7 @@ describe('ArkUI state → build() re-render bridge (assignment-gated)', () => {
     expect(synthEdgesTo(reset.id)).toHaveLength(1);
     // A read-only method gets NO re-render edge — the precision line.
     expect(synthEdgesTo(describeCount.id)).toHaveLength(0);
+    await cg.closeAsync();
   });
 });
 
@@ -280,6 +283,7 @@ describe('ArkUI @ohos.events.emitter bridge', () => {
           (e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === 'arkui-emitter'
       );
     expect(bridged).toHaveLength(1);
+    await cg.closeAsync();
   });
 
   it('numeric-literal event ids never pair across files', async () => {
@@ -309,6 +313,7 @@ describe('ArkUI @ohos.events.emitter bridge', () => {
       .getOutgoingEdges(fireA.id)
       .filter((e) => e.target === listenB.id);
     expect(bridged).toHaveLength(0);
+    await cg.closeAsync();
   });
 });
 
@@ -357,6 +362,7 @@ describe('ArkUI router bridge (pushUrl literal → @Entry struct)', () => {
           (e.metadata as Record<string, unknown> | undefined)?.synthesizedBy === 'arkui-route'
       );
     expect(bridged).toHaveLength(1);
+    await cg.closeAsync();
   });
 });
 
@@ -424,5 +430,6 @@ describe('ohpm main entry (custom barrel + .ts consumer)', () => {
     // .ts consumer: the type annotation reference reaches the .ets class.
     const report = cg.getNodesByKind('function').find((n) => n.name === 'report')!;
     expect(cg.getOutgoingEdges(report.id).map((e) => e.target)).toContain(repo.id);
+    await cg.closeAsync();
   });
 });

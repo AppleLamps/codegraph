@@ -84,11 +84,13 @@ describe('MCP project resolution via roots/list (issue #196)', () => {
     projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-mcp-proj-'));
   });
 
-  afterEach(() => {
-    if (child && !child.killed) {
+  afterEach(async () => {
+    if (child && child.exitCode === null) {
+      const closed = new Promise<void>((resolve) => child!.once('close', () => resolve()));
       child.kill('SIGKILL');
-      child = null;
+      await closed;
     }
+    child = null;
     fs.rmSync(cwdDir, { recursive: true, force: true });
     fs.rmSync(projectDir, { recursive: true, force: true });
   });

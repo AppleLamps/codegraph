@@ -11,7 +11,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { execFileSync } from 'child_process';
-import CodeGraph from '../src/index';
+import CodeGraph, { LockUnavailableError } from '../src/index';
 
 describe('Sync Module', () => {
   describe('Sync Functionality', () => {
@@ -90,6 +90,18 @@ describe('Sync Module', () => {
     });
 
     describe('sync()', () => {
+      it('throws a typed error when another process owns the project lock', async () => {
+        const lock = (cg as any).fileLock;
+        const originalAcquire = lock.acquire.bind(lock);
+        lock.acquire = () => {
+          throw new Error('held by another process');
+        };
+
+        await expect(cg.sync()).rejects.toBeInstanceOf(LockUnavailableError);
+
+        lock.acquire = originalAcquire;
+      });
+
       it('should reindex added files', async () => {
         // Add a new file
         fs.writeFileSync(

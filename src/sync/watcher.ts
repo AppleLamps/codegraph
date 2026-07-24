@@ -312,6 +312,8 @@ export class FileWatcher {
    */
   private syncStartedMs = 0;
   private syncing = false;
+  /** Resolvers waiting for the currently-running sync to leave its finally block. */
+  private drainWaiters: Array<() => void> = [];
   private stopped = false;
   /**
    * True once the initial watch set is established. Unlike the previous
@@ -746,6 +748,20 @@ export class FileWatcher {
   }
 
   /**
+   * Stop accepting new events and wait for an already-running sync to finish.
+   *
+   * `stop()` stays synchronous for backwards compatibility, but lifecycle
+   * owners that are about to close SQLite or remove the project directory must
+   * use this barrier. Without it, `CodeGraph.close()` could finalize prepared
+   * statements while `syncFn` was still using them.
+   */
+  async stopAndDrain(): Promise<void> {
+    this.stop();
+    if (!this.syncing) return;
+    await new Promise<void>((resolve) => this.drainWaiters.push(resolve));
+  }
+
+  /**
    * @internal Test-only: feed a synthetic project-relative change through the
    * same filter → pendingFiles → debounced-sync path a real fs.watch event
    * takes. Lets the watcher / staleness-banner suites stay deterministic
@@ -920,6 +936,8 @@ export class FileWatcher {
       // still unindexed; the rescheduled sync sees the same set.
     } finally {
       this.syncing = false;
+      const waiters = this.drainWaiters.splice(0);
+      for (const resolve of waiters) resolve();
 
       // If pending files remain (mid-sync events, or this sync failed),
       // schedule another pass. After EITHER failure mode — lock contention or a

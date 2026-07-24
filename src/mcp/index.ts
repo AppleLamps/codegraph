@@ -279,7 +279,7 @@ export class MCPServer {
    * connected session; in direct mode it mirrors the pre-#411 behavior (close
    * cg, exit). Proxy mode never routes through here — the proxy exits itself.
    */
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
     if (this.ppidWatchdog) {
@@ -291,7 +291,7 @@ export class MCPServer {
       this.livenessWatchdog = null;
     }
     if (this.daemon) {
-      void this.daemon.stop('stop()');
+      await this.daemon.stop('stop()');
       // Daemon.stop calls process.exit; nothing else to do.
       return;
     }
@@ -300,7 +300,7 @@ export class MCPServer {
       this.session = null;
     }
     if (this.engine) {
-      this.engine.stop();
+      await this.engine.stopAsync();
       this.engine = null;
     }
     process.exit(0);

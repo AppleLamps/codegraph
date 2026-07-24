@@ -231,9 +231,9 @@ describe('multi-repo workspaces (#514) + .gitignore-respect default (#970, #976)
 
         expect(cg.searchNodes('logout', { limit: 5 }).length).toBeGreaterThan(0);
       } finally {
-        cg.destroy();
+        await cg.closeAsync();
       }
-    });
+    }, 15000);
   });
 
   describe('discovery/classifier machinery (exercised under opt-in)', () => {

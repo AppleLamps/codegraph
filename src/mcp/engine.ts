@@ -62,6 +62,7 @@ export class MCPEngine {
   private watcherStarted = false;
   private opts: Required<MCPEngineOptions>;
   private closed = false;
+  private stopPromise: Promise<void> | null = null;
   // Off-loop read-tool pool (daemon mode only). Created lazily once the default
   // project is open — workers each hold their own WAL read connection.
   private queryPool: QueryPool | null = null;
@@ -182,18 +183,28 @@ export class MCPEngine {
    * and on direct-mode stop. Idempotent.
    */
   stop(): void {
+    void this.stopAsync();
+  }
+
+  /** Graceful async shutdown that waits for workers and watcher syncs. */
+  stopAsync(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = this.performStop();
+    return this.stopPromise;
+  }
+
+  private async performStop(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     // Detach + terminate the worker pool first so no tool call routes to a
     // worker mid-teardown; outstanding pool calls resolve with graceful guidance.
     this.toolHandler.setQueryPool(null);
-    if (this.queryPool) {
-      void this.queryPool.destroy();
-      this.queryPool = null;
-    }
-    this.toolHandler.closeAll();
+    const pool = this.queryPool;
+    this.queryPool = null;
+    if (pool) await pool.destroy();
+    await this.toolHandler.closeAllAsync();
     if (this.cg) {
-      try { this.cg.close(); } catch { /* ignore */ }
+      try { await this.cg.closeAsync(); } catch { /* ignore */ }
       this.cg = null;
     }
   }

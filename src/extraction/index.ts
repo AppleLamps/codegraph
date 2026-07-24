@@ -2530,10 +2530,7 @@ export class ExtractionOrchestrator {
     let trackedFiles: FileRecord[];
     if (scopedPaths && scopedPaths.length > 0) {
       // Scoped reconcile: stat only the reported paths. filesChecked counts
-      // the PATHS examined (not the files found) — it must stay non-zero even
-      // when every scoped path was a deletion, because CodeGraph.watch()
-      // reads `filesChecked === 0 && durationMs === 0` as the
-      // lock-unavailable signature (#449).
+      // the PATHS examined (not the files found), including deletions.
       const unique = [...new Set(scopedPaths)];
       currentFiles = unique.filter((p) => fs.existsSync(path.join(this.rootDir, p)));
       trackedFiles = [];

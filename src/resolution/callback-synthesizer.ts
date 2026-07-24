@@ -3678,7 +3678,7 @@ export async function synthesizeCallbackEdges(
 
   const goMethodContains = has('go') ? await goCrossFileMethodContainsEdges(queries, yieldToLoop) : NONE;
   for (let i = 0; i < goMethodContains.length; i += 2000) {
-    queries.insertEdges(goMethodContains.slice(i, i + 2000));
+    queries.upsertSynthesizedEdges(goMethodContains.slice(i, i + 2000));
     await yieldToLoop();
     await foldIfOver();
   }
@@ -3690,7 +3690,7 @@ export async function synthesizeCallbackEdges(
   // edges from extraction, so they don't need this pre-pass.)
   const goImpl = has('go') ? await goImplementsEdges(queries, yieldToLoop) : NONE;
   for (let i = 0; i < goImpl.length; i += 2000) {
-    queries.insertEdges(goImpl.slice(i, i + 2000));
+    queries.upsertSynthesizedEdges(goImpl.slice(i, i + 2000));
     await yieldToLoop();
     await foldIfOver();
   }
@@ -3778,7 +3778,7 @@ export async function synthesizeCallbackEdges(
   // edge set is ~275k rows, and one transaction for all of them was a 20s
   // unyielded main-thread span (#1212 follow-up) — the last one in the tail.
   for (let i = 0; i < merged.length; i += 2000) {
-    queries.insertEdges(merged.slice(i, i + 2000));
+    queries.upsertSynthesizedEdges(merged.slice(i, i + 2000));
     await yieldToLoop();
     await foldIfOver();
   }

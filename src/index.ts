@@ -139,6 +139,7 @@ export interface IndexOptions {
  * settles instead of one per save. Override with CODEGRAPH_SYNTH_DEBOUNCE_MS.
  */
 const DEFAULT_SYNTH_DEBOUNCE_MS = 6000;
+const DYNAMIC_DISPATCH_DIRTY_KEY = 'dynamic_dispatch_dirty';
 
 /** Parse CODEGRAPH_SYNTH_DEBOUNCE_MS, falling back on anything non-numeric. */
 export function resolveSynthDebounceMs(raw: string | undefined): number {
@@ -176,6 +177,8 @@ export class CodeGraph {
   private synthesisDirty = false;
   private synthesisRunning = false;
   private synthesisClosed = false;
+  private closed = false;
+  private closePromise: Promise<void> | null = null;
 
   // File lock for preventing concurrent writes across processes (CLI, MCP, git hooks)
   private fileLock: FileLock;
@@ -436,6 +439,31 @@ export class CodeGraph {
    * Close the CodeGraph instance and release resources
    */
   close(): void {
+    if (this.closed || this.closePromise) return;
+    this.prepareForClose();
+    this.finishClose();
+  }
+
+  /**
+   * Close CodeGraph after any watcher-driven sync already in flight finishes.
+   *
+   * Prefer this at lifecycle boundaries that immediately remove the project
+   * directory or exit a long-lived daemon. `close()` remains synchronous for
+   * backwards compatibility, but cannot provide an async work barrier.
+   */
+  async closeAsync(): Promise<void> {
+    if (this.closed) return;
+    if (this.closePromise) return this.closePromise;
+    const watcher = this.prepareForClose();
+    this.closePromise = (async () => {
+      await watcher?.stopAndDrain();
+      this.finishClose();
+    })();
+    return this.closePromise;
+  }
+
+  /** Stop new background work and detach the watcher for shutdown. */
+  private prepareForClose(): FileWatcher | null {
     // Disarm deferred re-synthesis before the DB goes away — a timer that
     // fired against a closed connection would throw from a bare setTimeout
     // callback with no caller to catch it.
@@ -444,7 +472,16 @@ export class CodeGraph {
       clearTimeout(this.synthesisTimer);
       this.synthesisTimer = null;
     }
-    this.unwatch();
+    const watcher = this.watcher;
+    this.watcher = null;
+    watcher?.stop();
+    return watcher;
+  }
+
+  /** Release storage resources exactly once after background work is quiescent. */
+  private finishClose(): void {
+    if (this.closed) return;
+    this.closed = true;
     // Release file lock if held
     this.fileLock.release();
     this.db.close();
@@ -639,6 +676,9 @@ export class CodeGraph {
             },
             walValve ? () => walValve!.backpressure() : undefined
           );
+          // A completed full synthesis satisfies any deferred obligation left
+          // by an earlier short-lived incremental sync.
+          try { this.queries.setMetadata(DYNAMIC_DISPATCH_DIRTY_KEY, '0'); } catch { /* advisory */ }
           if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] resolution: ${Date.now() - tResolve}ms`);
 
           // Second pass: chained calls whose method lives on a supertype the
@@ -777,7 +817,11 @@ export class CodeGraph {
       try {
         this.fileLock.acquire();
       } catch {
-        return { filesChecked: 0, filesAdded: 0, filesModified: 0, filesRemoved: 0, nodesUpdated: 0, durationMs: 0 };
+        // Never disguise lock contention as a clean no-op sync. Direct
+        // CLI/library callers need a failure they can act on, while the
+        // watcher recognizes this typed error and preserves its pending files
+        // for a retry.
+        throw new LockUnavailableError();
       }
       // Defer WAL auto-checkpointing for the whole incremental run, exactly
       // as indexAll does for the bulk path (#1231): sync's store loop and its
@@ -979,17 +1023,16 @@ export class CodeGraph {
         // when an agent is leaning on it hardest.
         //
         // The passes are whole-graph: their cost tracks REPO size, not change
-        // size, so a one-line edit in a big repo would otherwise pay the full
-        // pass on every save. When a watcher is driving syncs we hand off to a
-        // coalescing timer — a burst of edits costs ONE pass once the tree
-        // settles. A one-shot sync (CLI, library caller) has no later moment to
-        // run in and its caller is already waiting, so it pays inline.
+        // size, so incremental sync must never pay them inline. Persist the
+        // obligation before handing it to an unref'd coalescing timer. A
+        // long-lived watcher/library instance runs it after the tree settles;
+        // a short-lived CLI/git hook can exit promptly and the next watcher
+        // session resumes the durable obligation.
         if ((filesChanged || result.filesRemoved > 0) && !synthesizedByBatchedPass) {
-          if (this.isWatching()) {
-            this.scheduleDynamicDispatchSynthesis();
-          } else {
-            await this.runDynamicDispatchSynthesis(options.onProgress);
-          }
+          this.queries.setMetadata(DYNAMIC_DISPATCH_DIRTY_KEY, '1');
+          this.scheduleDynamicDispatchSynthesis();
+        } else if (synthesizedByBatchedPass) {
+          this.queries.setMetadata(DYNAMIC_DISPATCH_DIRTY_KEY, '0');
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
@@ -1050,7 +1093,7 @@ export class CodeGraph {
    */
   private async runDynamicDispatchSynthesis(
     onProgress?: (progress: IndexProgress) => void
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const t0 = Date.now();
       await this.resolver.synthesizeDynamicDispatchEdges((done, totalPasses) => {
@@ -1059,8 +1102,12 @@ export class CodeGraph {
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
         console.error(`[phase-timing] sync-callback-synthesis: ${Date.now() - t0}ms`);
       }
+      this.queries.setMetadata(DYNAMIC_DISPATCH_DIRTY_KEY, '0');
+      return true;
     } catch {
       // Synthesis is additive and optional; never fail a sync over it.
+      this.queries.setMetadata(DYNAMIC_DISPATCH_DIRTY_KEY, '1');
+      return false;
     }
   }
 
@@ -1107,10 +1154,9 @@ export class CodeGraph {
           return;
         }
         try {
-          // Cleared only after both locks are held: any later schedule request
-          // is genuinely newer than the graph state this pass will read.
-          this.synthesisDirty = false;
-          await this.runDynamicDispatchSynthesis();
+          // Cleared only after a successful pass. A failure keeps both the
+          // in-memory and persisted obligations dirty for a later retry.
+          this.synthesisDirty = !(await this.runDynamicDispatchSynthesis());
         } finally {
           this.fileLock.release();
         }
@@ -1145,21 +1191,17 @@ export class CodeGraph {
       this.projectRoot,
       async (paths?: string[]) => {
         const result = await this.sync({ paths });
-        // sync() returns this exact zero-shape iff it failed to acquire the
-        // file lock (a real empty sync always has filesChecked > 0 because
-        // scanDirectory ran). Surface that to the watcher as a typed error
-        // so it keeps pendingFiles + reschedules instead of clearing them
-        // (#449).
-        if (result.filesChecked === 0 && result.durationMs === 0) {
-          throw new LockUnavailableError();
-        }
         const filesChanged = result.filesAdded + result.filesModified + result.filesRemoved;
         return { filesChanged, durationMs: result.durationMs };
       },
       options
     );
 
-    return this.watcher.start();
+    const started = this.watcher.start();
+    if (started && this.queries.getMetadata(DYNAMIC_DISPATCH_DIRTY_KEY) === '1') {
+      this.scheduleDynamicDispatchSynthesis();
+    }
+    return started;
   }
 
   /**
@@ -1170,6 +1212,13 @@ export class CodeGraph {
       this.watcher.stop();
       this.watcher = null;
     }
+  }
+
+  /** Stop watching and wait for a watcher sync already in flight to finish. */
+  async unwatchAsync(): Promise<void> {
+    const watcher = this.watcher;
+    this.watcher = null;
+    await watcher?.stopAndDrain();
   }
 
   /**

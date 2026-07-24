@@ -261,7 +261,13 @@ export class QueryBuilder {
    * Run `rows` through a multi-row `INSERT` built as `head + (tuple,)*n`,
    * decomposed greedily into the cached batch sizes. Preserves row order.
    */
-  private runBatched(kind: string, head: string, tuple: string, rows: unknown[][]): void {
+  private runBatched(
+    kind: string,
+    head: string,
+    tuple: string,
+    rows: unknown[][],
+    tail = ''
+  ): void {
     if (rows.length === 0) return;
     let i = 0;
     for (const size of QueryBuilder.BATCH_SIZES) {
@@ -269,7 +275,7 @@ export class QueryBuilder {
         const key = `${kind}:${size}`;
         let stmt = this.batchStmts.get(key);
         if (!stmt) {
-          stmt = this.db.prepare(head + new Array(size).fill(tuple).join(','));
+          stmt = this.db.prepare(head + new Array(size).fill(tuple).join(',') + tail);
           this.batchStmts.set(key, stmt);
         }
         if (size === 1) {
@@ -1696,6 +1702,55 @@ export class QueryBuilder {
         'INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance) VALUES ',
         '(?,?,?,?,?,?,?)',
         rows
+      );
+    })();
+  }
+
+  /**
+   * Insert synthesized edges, refreshing mutable wiring details on identity
+   * conflicts. Synthesizers rediscover the same structural edge after edits,
+   * but metadata such as `registeredAt` and call-site geometry may have moved.
+   *
+   * Keep this separate from insertEdges(): extraction can emit competing
+   * candidates for one structural identity and intentionally remains
+   * first-wins.
+   */
+  upsertSynthesizedEdges(edges: Edge[]): void {
+    if (edges.length === 0) return;
+
+    this.db.transaction(() => {
+      const endpointIds = new Set<string>();
+      for (const edge of edges) {
+        endpointIds.add(edge.source);
+        endpointIds.add(edge.target);
+      }
+      const existingNodeIds = this.getExistingNodeIds([...endpointIds]);
+
+      const rows: unknown[][] = [];
+      for (const edge of edges) {
+        if (!existingNodeIds.has(edge.source) || !existingNodeIds.has(edge.target)) continue;
+        rows.push([
+          edge.source,
+          edge.target,
+          edge.kind,
+          edge.metadata ? JSON.stringify(edge.metadata) : null,
+          edge.line ?? null,
+          edge.column ?? null,
+          edge.provenance ?? null,
+        ]);
+      }
+      this.runBatched(
+        'upsertSynthesizedEdges',
+        `INSERT INTO edges (source, target, kind, metadata, line, col, provenance) VALUES `,
+        '(?,?,?,?,?,?,?)',
+        rows,
+        ` ON CONFLICT DO UPDATE SET
+           metadata = excluded.metadata,
+           line = excluded.line,
+           col = excluded.col,
+           provenance = excluded.provenance
+         WHERE edges.provenance = 'heuristic'
+            OR json_extract(edges.metadata, '$.synthesizedBy') IS NOT NULL`
       );
     })();
   }
